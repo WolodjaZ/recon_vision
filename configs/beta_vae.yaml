@@ -1,0 +1,41 @@
+model_params:
+  _target_: models.vae.BetaVAE
+  name: 'BetaVAE'
+  in_channels: 3
+  latent_dim: 256
+  kld_weight: 0.00025
+  loss_type: 'B'
+  gamma: 10.0
+  max_capacity: 25
+  Capacity_max_iter: 10000
+
+
+data_params:
+  _target_: datasets.ImagenetteDataset
+  name: 'imagenette'
+  data_path: "/mnt/data/alzaig"
+  img_size: 256
+  batch_size: 64
+  workers: 8
+
+
+exp_params:
+  seed: 0
+  criterion_name: smoothl1
+  criterion_delta: 0.5
+  device: cuda
+  epochs: 100
+  log_images_interval: 10
+  checkpoint_freq: 10
+
+
+optimizer:
+  _target_: torch.optim.SGD
+  momentum: 0.9
+  weight_decay: 0.0
+  lr: 0.005
+
+
+logging_params:
+  log_dir: "/mnt/data/alzaig/logs"
+  checkpoint_dir: "/mnt/data/alzaig/checkpoints"
