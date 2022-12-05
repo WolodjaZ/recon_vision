@@ -7,6 +7,7 @@ from omegaconf import OmegaConf
 from hydra.utils import instantiate
 import torch.nn.functional as F
 from collections import namedtuple
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from utils import fix_random_seeds, set_logger
@@ -57,7 +58,12 @@ def train(cfg):
     
     logger.info(f"Building model {cfg.model_params['name']} done")
     
-    optimizer = instantiate(cfg.optimizer, params=model.parameters())
+    if "Pix2Pix" in cfg.model_params['name']:
+        optimizer = instantiate(cfg.optimizer, params=model.netD.parameters())
+        optimizer_G = instantiate(cfg.optimizer_g, params=model.netG.parameters())
+    else:
+        optimizer = instantiate(cfg.optimizer, params=model.parameters())
+        optimizer_G = None
     logger.info("Building optimizer and criterion done.")
     
     # Tensorboard
@@ -65,29 +71,61 @@ def train(cfg):
     writer = SummaryWriter(
         log_dir=cfg.logging_params['log_dir'] + "/" + name_log
     )
-    os.makedirs(os.path.join(cfg.logging_params['checkpoint_dir'], name_log), exist_ok=False)
     mssim = MSSIM()
+    
+    if os.path.exists(cfg.logging_params['log_dir'] + "/" + name_log):
+        logger.info("Log directory already exists, so we are taking the last checkpoint.")
+        checkpoint = torch.load(cfg.logging_params['log_dir'] + "/" + name_log + "/last_checkpoint.pth")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if "Pix2Pix" in cfg.model_params['name']:
+            optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
+        best = checkpoint['mae']
+    else:
+        os.makedirs(os.path.join(cfg.logging_params['checkpoint_dir'], name_log), exist_ok=False)
+        best = None
     
     logger.info("Start training")
     best = None
     for epoch in range(cfg.exp_params['epochs']):
         logger.info(f"Epoch {epoch + 1}/{cfg.exp_params['epochs']}")
+        
+        model.train()
+        scaler = GradScaler()
+        
         avg_losses = {}
         for batch in tqdm(train_loader, desc="Training", leave=False):
             optimizer.zero_grad(set_to_none=True)
             batch = batch.to(cfg.exp_params['device'])
-            out = model(batch)
+            with autocast():  # mixed precision
+                out = model(batch)
             losses = model.loss_function(*out)
             loss = losses["loss"]
-            loss.backward()
-            optimizer.step()
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             for key, value in losses.items():
                 if f"train/{key}" not in avg_losses:
                     avg_losses[f"train/{key}"] = [value.item()]
                 else:
                     avg_losses[f"train/{key}"].append(value.item())
+            
+            if optimizer_G:
+                optimizer_G.zero_grad(set_to_none=True)
+                loss = model.loss_function_G(*out)
+                loss = losses["loss_G"]
+                loss.backward()
+                optimizer_G.step()
+                
+                for key, value in losses.items():
+                    if f"train/{key}" not in avg_losses:
+                        avg_losses[f"train/{key}"] = [value.item()]
+                    else:
+                        avg_losses[f"train/{key}"].append(value.item())
         
+        model.eval()
         with torch.inference_mode():
             logged = False
             for batch in tqdm(val_loader, desc="Evaluating", leave=False):
@@ -135,6 +173,7 @@ def train(cfg):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'optimizer_G_state_dict': optimizer_G.state_dict() if optimizer_G else None,
                 'loss': avg_losses['train/loss'],
                 'mae': avg_losses['val/mae'],
             }, checkpoint_path)
@@ -145,6 +184,7 @@ def train(cfg):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'optimizer_G_state_dict': optimizer_G.state_dict() if optimizer_G else None,
                 'loss': avg_losses['train/loss'],
                 'mae': avg_losses['val/mae'],
             }, checkpoint_path)
@@ -152,6 +192,7 @@ def train(cfg):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'optimizer_G_state_dict': optimizer_G.state_dict() if optimizer_G else None,
                 'loss': avg_losses['train/loss'],
                 'mae': avg_losses['val/mae'],
             }, checkpoint_last)
@@ -162,6 +203,7 @@ def train(cfg):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'optimizer_G_state_dict': optimizer_G.state_dict() if optimizer_G else None,
                 'loss': avg_losses['train/loss'],
                 'mae': avg_losses['val/mae'],
             }, checkpoint_last)
