@@ -2,7 +2,10 @@ from typing import List, Any, Callable, Union
 
 import torch
 from torch import nn
+import functools
 from torch.nn import functional as F
+
+from discriminator import NLayerDiscriminator, PixelDiscriminator
 
 
 class UnetGenerator(nn.Module):
@@ -105,84 +108,6 @@ class UnetSkipConnectionBlock(nn.Module):
             return torch.cat([x, self.model(x)], 1)
 
 
-class NLayerDiscriminator(nn.Module):
-    """Defines a PatchGAN discriminator"""
-
-    def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d):
-        """Construct a PatchGAN discriminator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            ndf (int)       -- the number of filters in the last conv layer
-            n_layers (int)  -- the number of conv layers in the discriminator
-            norm_layer      -- normalization layer
-        """
-        super(NLayerDiscriminator, self).__init__()
-        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
-            use_bias = norm_layer.func == nn.InstanceNorm2d
-        else:
-            use_bias = norm_layer == nn.InstanceNorm2d
-
-        kw = 4
-        padw = 1
-        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
-        nf_mult = 1
-        nf_mult_prev = 1
-        for n in range(1, n_layers):  # gradually increase the number of filters
-            nf_mult_prev = nf_mult
-            nf_mult = min(2 ** n, 8)
-            sequence += [
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-                norm_layer(ndf * nf_mult),
-                nn.LeakyReLU(0.2, True)
-            ]
-
-        nf_mult_prev = nf_mult
-        nf_mult = min(2 ** n_layers, 8)
-        sequence += [
-            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
-            norm_layer(ndf * nf_mult),
-            nn.LeakyReLU(0.2, True)
-        ]
-
-        sequence += [nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]  # output 1 channel prediction map
-        self.model = nn.Sequential(*sequence)
-
-    def forward(self, input):
-        """Standard forward."""
-        return self.model(input)
-
-
-class PixelDiscriminator(nn.Module):
-    """Defines a 1x1 PatchGAN discriminator (pixelGAN)"""
-
-    def __init__(self, input_nc, ndf=64, norm_layer=nn.BatchNorm2d):
-        """Construct a 1x1 PatchGAN discriminator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            ndf (int)       -- the number of filters in the last conv layer
-            norm_layer      -- normalization layer
-        """
-        super(PixelDiscriminator, self).__init__()
-        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
-            use_bias = norm_layer.func == nn.InstanceNorm2d
-        else:
-            use_bias = norm_layer == nn.InstanceNorm2d
-
-        self.net = [
-            nn.Conv2d(input_nc, ndf, kernel_size=1, stride=1, padding=0),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(ndf, ndf * 2, kernel_size=1, stride=1, padding=0, bias=use_bias),
-            norm_layer(ndf * 2),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(ndf * 2, 1, kernel_size=1, stride=1, padding=0, bias=use_bias)]
-
-        self.net = nn.Sequential(*self.net)
-
-    def forward(self, input):
-        """Standard forward."""
-        return self.net(input)
-
-
 class GANLoss(nn.Module):
     """Define different GAN objectives.
     The GANLoss class abstracts away the need to create the target label tensor
@@ -245,55 +170,101 @@ class GANLoss(nn.Module):
         return loss
 
 
-class pix2pix(nn.Module):
-    def __init__(self, recon_loss, gan_mode, device, lambda_recon, input_nc, output_nc, ngf, ndf, n_layers_D, norm_layer=nn.BatchNorm2d, use_dropout=False, pixe_D=False):
+class Pix2Pix(nn.Module):
+    def __init__(self, recon_loss, gan_mode, lambda_recon, input_nc, output_nc, ngf, ndf, n_layers_D, norm_layer=nn.BatchNorm2d, use_dropout=False, pixe_D=False):
+        super(Pix2Pix, self).__init__()
         self.recon_loss = recon_loss
         self.lambda_recon = lambda_recon
-        self.gan_loss = GANLoss(gan_mode).to(device)
-        self.netG = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout).to(device)
+        self.gan_loss = GANLoss(gan_mode)
+        self.netG = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
         if pixe_D:
             self.netD = PixelDiscriminator(input_nc + output_nc, ndf, norm_layer=norm_layer)
         else:
             self.netD = NLayerDiscriminator(input_nc, ndf, n_layers_D, norm_layer=norm_layer)
-        self.netD = self.netD.to(device)
-        
+        self.netD = self.netD
+        self.netD.train()
+    
+    def to(self, device):
+        super().to(device)
+        self.netG.to(device)
+        self.netD.to(device)
+        self.gan_loss.to(device)
+        return self
+
+    def train(self, mode: bool = True):
+        self.netG.train(mode)
+        return super().train(mode)
+
+    def eval(self):
+        self.netG.eval()
+        return super().eval()
+    
     def forward(self, input):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
-        output = self.netG(input)  # G(A)
-        return output
+        ine, out = input
+        output = self.netG(ine)  # G(A)
+        return [output, out, ine]
     
     def loss_function(self,
                       *args,
                       **kwargs) -> dict:
         
-        real = args[0] 
-        fake = args[1]
+        fake = args[0]
+        real = args[1]
+        input = args[2]
         
-        fake_AB = torch.cat((real, fake), 1)
-        pred_fake = self.netD(fake_AB)
-        loss_G_GAN = self.gan_loss(pred_fake, True)
-        # Second, G(A) = B
-        loss_G_recon = self.recon_loss(fake, real) * self.lambda_recon
-        # combine loss and calculate gradients
-        loss = loss_G_GAN + loss_G_recon
-        return {'loss': loss, 'G_Gan':loss_G_GAN, 'G_recon':loss_G_recon}
+        # enable backprop for D
+        for param in self.netD.parameters():
+            param.requires_grad = True
+        
+        # Fake Detection and Loss
+        pred_fake = self.netD(fake.detach())
+        loss_gan_fake = self.gan_loss(pred_fake, False)
+        
+        # Real Detection and Loss
+        pred_real = self.netD(real)
+        loss_gan_real = self.gan_loss(pred_real, True)
+        
+        # combine loss
+        loss = (loss_gan_fake + loss_gan_real) * 0.5
+        return {'loss': loss, 'D_fake':loss_gan_fake, 'D_real':loss_gan_real}
 
-    def loss_function_D(self,
+    def loss_function_G(self,
                       *args,
                       **kwargs) -> dict:
         
-        real = args[0] 
-        fake = args[1]
+        fake = args[0]
+        real = args[1]
+        input = args[2]
         
-        # Fake; stop backprop to the generator by detaching fake_B
-        fake_AB = torch.cat((real, fake), 1)  # we use conditional GANs; we need to feed both input and output to the discriminator
-        pred_fake = self.netD(fake_AB.detach())
-        loss_D_fake = self.gan_loss(pred_fake, False)
-        # Real
-        real_AB = torch.cat((real, self.real_B), 1)
-        pred_real = self.netD(real_AB)
-        loss_D_real = self.gan_loss(pred_real, True)
-        # combine loss and calculate gradients
-        loss = (self.loss_D_fake + self.loss_D_real) * 0.5
-        return {'loss': loss, 'D_fake':loss_D_fake, 'D_real':loss_D_real}
+        # disable backprop for D
+        for param in self.netD.parameters():
+            param.requires_grad = False
+        
+        pred_fake = self.netD(fake)
+        loss_gan = self.gan_loss(pred_fake, True)
+        recon_loss = self.recon_loss(fake, real) * self.lambda_recon
+        
+        # combine loss
+        loss = loss_gan + recon_loss
+        return {'loss_G': loss, 'G_GAN':loss_gan, 'G_recon':recon_loss}
+
+
+if __name__ == "__main__":
+    # Data testing
+    true_data = torch.normal(0, 1, size=(2, 3, 256, 256))
+    input_data = torch.normal(0, 1, size=(2, 3, 256, 256))
+    data = (input_data, true_data)
+    recon_loss = nn.MSELoss()
     
+    # Test models
+    model = Pix2Pix(recon_loss, 'vanilla', 100.0, 3, 3, 64, 64, 3)
+    
+    #Check discriminator
+    output = model(data)
+    loss = model.loss_function(*output)
+    print(loss)
+    
+    #Check generator
+    loss = model.loss_function_G(*output)
+    print(loss)
