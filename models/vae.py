@@ -42,7 +42,7 @@ class VanillaVAE(BaseVAE):
                  hidden_dims: List = None,
                  kld_weight: float = 1.0,
                  **kwargs) -> None:
-        super(BetaVAE, self).__init__(recon_loss=recon_loss)
+        super(VanillaVAE, self).__init__(recon_loss=recon_loss)
 
         self.kld_weight = kld_weight
         self.latent_dim = latent_dim
