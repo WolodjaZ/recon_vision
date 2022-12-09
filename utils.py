@@ -1,3 +1,4 @@
+import random
 import torch
 import numpy as np
 import time
@@ -22,7 +23,7 @@ class LogFormatter:
         return "%s - %s" % (prefix, message) if message else ""
 
 
-def set_logger():
+def set_logger(rank=0):
     """
     Create a logger.
     Use a different log file for each process.
@@ -33,6 +34,8 @@ def set_logger():
 
     # create file handler and set level to debug
     if filepath is not None:
+        if rank > 0:
+            filepath = "%s-%i" % (filepath, rank)
         file_handler = logging.FileHandler(filepath, "a")
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(log_formatter)
@@ -65,5 +68,7 @@ def fix_random_seeds(seed=31):
     Fix random seeds.
     """
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
+    random.seed(seed)

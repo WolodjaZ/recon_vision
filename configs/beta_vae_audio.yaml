@@ -1,20 +1,21 @@
 model_params:
-  _target_: models.vae.VQVAE
-  name: 'VQVAE'
+  _target_: models.vae.BetaVAE
+  name: 'BetaVAE'
   in_channels: 3
   latent_dim: 256
-  embedding_dim: 128
-  num_embeddings: 512
-  img_size: 64
-  beta: 0.25
+  kld_weight: 0.00025
+  loss_type: 'B'
+  gamma: 10.0
+  max_capacity: 25
+  Capacity_max_iter: 10000
 
 
 data_params:
-  _target_: datasets.ImagenetteDataset
-  name: 'imagenette'
+  _target_: datasets.AudioMnistDataset
+  name: 'audiomnist'
   data_path: "/mnt/data/alzaig"
   img_size: 256
-  batch_size: 32
+  batch_size: 64
   workers: 8
 
 
@@ -23,7 +24,7 @@ exp_params:
   criterion_name: smoothl1
   criterion_delta: 0.5
   device: cuda
-  epochs: 100
+  epochs: 10
   log_images_interval: 10
   checkpoint_freq: 10
 
