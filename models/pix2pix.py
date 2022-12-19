@@ -5,7 +5,7 @@ from torch import nn
 import functools
 from torch.nn import functional as F
 
-from discriminator import NLayerDiscriminator, PixelDiscriminator
+from discriminator import NLayerDiscriminator, PixelDiscriminator, init_weights
 
 
 class UnetGenerator(nn.Module):
@@ -108,99 +108,27 @@ class UnetSkipConnectionBlock(nn.Module):
             return torch.cat([x, self.model(x)], 1)
 
 
-class GANLoss(nn.Module):
-    """Define different GAN objectives.
-    The GANLoss class abstracts away the need to create the target label tensor
-    that has the same size as the input.
-    """
-
-    def __init__(self, gan_mode, target_real_label=1.0, target_fake_label=0.0):
-        """ Initialize the GANLoss class.
-        Parameters:
-            gan_mode (str) - - the type of GAN objective. It currently supports vanilla, lsgan, and wgangp.
-            target_real_label (bool) - - label for a real image
-            target_fake_label (bool) - - label of a fake image
-        Note: Do not use sigmoid as the last layer of Discriminator.
-        LSGAN needs no sigmoid. vanilla GANs will handle it with BCEWithLogitsLoss.
-        """
-        super(GANLoss, self).__init__()
-        self.register_buffer('real_label', torch.tensor(target_real_label))
-        self.register_buffer('fake_label', torch.tensor(target_fake_label))
-        self.gan_mode = gan_mode
-        if gan_mode == 'lsgan':
-            self.loss = nn.MSELoss()
-        elif gan_mode == 'vanilla':
-            self.loss = nn.BCEWithLogitsLoss()
-        elif gan_mode in ['wgangp']:
-            self.loss = None
-        else:
-            raise NotImplementedError('gan mode %s not implemented' % gan_mode)
-
-    def get_target_tensor(self, prediction, target_is_real):
-        """Create label tensors with the same size as the input.
-        Parameters:
-            prediction (tensor) - - tpyically the prediction from a discriminator
-            target_is_real (bool) - - if the ground truth label is for real images or fake images
-        Returns:
-            A label tensor filled with ground truth label, and with the size of the input
-        """
-
-        if target_is_real:
-            target_tensor = self.real_label
-        else:
-            target_tensor = self.fake_label
-        return target_tensor.expand_as(prediction)
-
-    def __call__(self, prediction, target_is_real):
-        """Calculate loss given Discriminator's output and grount truth labels.
-        Parameters:
-            prediction (tensor) - - tpyically the prediction output from a discriminator
-            target_is_real (bool) - - if the ground truth label is for real images or fake images
-        Returns:
-            the calculated loss.
-        """
-        if self.gan_mode in ['lsgan', 'vanilla']:
-            target_tensor = self.get_target_tensor(prediction, target_is_real)
-            loss = self.loss(prediction, target_tensor)
-        elif self.gan_mode == 'wgangp':
-            if target_is_real:
-                loss = -prediction.mean()
-            else:
-                loss = prediction.mean()
-        return loss
-
-
 class Pix2Pix(nn.Module):
-    def __init__(self, recon_loss, gan_mode, lambda_recon, input_nc, output_nc, ngf, ndf, n_layers_D, norm_layer=nn.BatchNorm2d, use_dropout=False, pixe_D=False):
+    def __init__(self, recon_loss, gan_loss, lambda_recon, input_nc, output_nc, ngf, ndf, n_layers_D, norm_layer=nn.BatchNorm2d, use_dropout=False, pixe_D=False):
         super(Pix2Pix, self).__init__()
         self.recon_loss = recon_loss
         self.lambda_recon = lambda_recon
-        self.gan_loss = GANLoss(gan_mode)
+        self.gan_loss = gan_loss
         self.netG = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
+        init_weights(self.netG)
         if pixe_D:
-            self.netD = PixelDiscriminator(input_nc + output_nc, ndf, norm_layer=norm_layer)
+            self.netD = PixelDiscriminator(output_nc, ndf, norm_layer=norm_layer)
         else:
-            self.netD = NLayerDiscriminator(input_nc, ndf, n_layers_D, norm_layer=norm_layer)
-        self.netD = self.netD
+            self.netD = NLayerDiscriminator(output_nc, ndf, n_layers_D, norm_layer=norm_layer)
+        init_weights(self.netD)
         self.netD.train()
-    
-    def to(self, device):
-        super().to(device)
-        self.netG.to(device)
-        self.netD.to(device)
-        self.gan_loss.to(device)
-        return self
 
-    def train(self, mode: bool = True):
-        self.netG.train(mode)
-        return super().train(mode)
-
-    def eval(self):
-        self.netG.eval()
-        return super().eval()
-    
-    def forward(self, input):
+    def forward(self, input, train=False):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
+        if train:
+            self.netG.train()
+        else:
+            self.netG.eval()
         ine, out = input
         output = self.netG(ine)  # G(A)
         return [output, out, ine]
@@ -253,12 +181,26 @@ class Pix2Pix(nn.Module):
 if __name__ == "__main__":
     # Data testing
     true_data = torch.normal(0, 1, size=(2, 3, 256, 256))
-    input_data = torch.normal(0, 1, size=(2, 3, 256, 256))
+    input_data = torch.normal(0, 1, size=(2, 1, 256, 256))
     data = (input_data, true_data)
     recon_loss = nn.MSELoss()
     
+    def vanillagan_loss(
+        prediction: torch.Tensor,
+        target_is_real: bool,
+        real_label: float = 1.0,
+        fake_label: float = 0.0,
+    ):
+        if target_is_real:
+            target_tensor = torch.tensor(real_label).expand_as(prediction)
+        else:
+            target_tensor = torch.tensor(fake_label).expand_as(prediction)
+        return torch.mean(torch.nn.functional.binary_cross_entropy_with_logits(prediction, target_tensor))
+    
+    gan_loss = vanillagan_loss
+    
     # Test models
-    model = Pix2Pix(recon_loss, 'vanilla', 100.0, 3, 3, 64, 64, 3)
+    model = Pix2Pix(recon_loss, gan_loss, 100.0, 1, 3, 64, 64, 3)
     
     #Check discriminator
     output = model(data)

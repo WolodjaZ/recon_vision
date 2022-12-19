@@ -103,6 +103,71 @@ class MSSIM(torch.nn.Module):
         return 1 - output
 
 
+def lsgan_loss(
+    prediction: torch.Tensor,
+    target_is_real: bool,
+    
+    real_label: float = 1.0,
+    fake_label: float = 0.0,
+    
+) -> torch.Tensor:
+    """
+    Computes the Least Squares GAN loss
+    """
+    if target_is_real:
+        target_tensor = torch.tensor(real_label).expand_as(prediction)
+    else:
+        target_tensor = torch.tensor(fake_label).expand_as(prediction)
+    return torch.mean((prediction - target_tensor) ** 2)
+
+def lagan_loss(
+    prediction: torch.Tensor,
+    target_is_real: bool,
+    
+    real_label: float = 1.0,
+    fake_label: float = 0.0,
+    
+) -> torch.Tensor:
+    """
+    Computes the Least absolute GAN loss
+    """
+    if target_is_real:
+        target_tensor = torch.tensor(real_label).expand_as(prediction)
+    else:
+        target_tensor = torch.tensor(fake_label).expand_as(prediction)
+    return torch.mean(torch.abs(prediction - target_tensor))
+
+
+def vanillagan_loss(
+    prediction: torch.Tensor,
+    target_is_real: bool,
+    real_label: float = 1.0,
+    fake_label: float = 0.0,
+):
+    """
+    Vanilla GAN loss
+    """
+    if target_is_real:
+        target_tensor = torch.tensor(real_label).expand_as(prediction)
+    else:
+        target_tensor = torch.tensor(fake_label).expand_as(prediction)
+    return torch.mean(torch.nn.functional.binary_cross_entropy_with_logits(prediction, target_tensor))
+
+
+def wgan_loss(
+    prediction: torch.Tensor,
+    target_is_real: bool
+):
+    """
+    WGAN loss
+    """
+    if target_is_real:
+        loss = -prediction.mean()
+    else:
+        loss = prediction.mean()
+    return loss
+
+
 def get_loss(loss_name: str, delta: Optional[float] = None) -> Callable:
     if loss_name == "l1":
         return torch.nn.L1Loss()
@@ -118,5 +183,13 @@ def get_loss(loss_name: str, delta: Optional[float] = None) -> Callable:
         return torch.nn.HuberLoss(delta=delta)
     elif loss_name == "msssim":
         return MSSIM()
+    elif loss_name == "lsgan":
+        return lsgan_loss
+    elif loss_name == "lagan":
+        return lagan_loss
+    elif loss_name == "vanillagan":
+        return vanillagan_loss
+    elif loss_name == "wgan":
+        return wgan_loss
     else:
         raise ValueError(f"Loss {loss_name} not supported")

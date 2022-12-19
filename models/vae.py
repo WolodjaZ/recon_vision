@@ -7,6 +7,9 @@ from torch.nn import functional as F
 from abc import abstractmethod
 
 
+from discriminator import NLayerDiscriminator, PixelDiscriminator, init_weights
+
+
 class BaseVAE(nn.Module):
     def __init__(self, recon_loss: Callable) -> None:
         super(BaseVAE, self).__init__()
@@ -25,12 +28,83 @@ class BaseVAE(nn.Module):
         raise NotImplementedError
 
     @abstractmethod
-    def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, *inputs: torch.Tensor, train: bool=False) -> torch.Tensor:
         pass
 
     @abstractmethod
     def loss_function(self, *inputs: Any, **kwargs) -> torch.Tensor:
         pass
+
+class GanVAE(nn.Module):
+    def __init__(self, model, recon_loss, gan_loss, lambda_recon, input_nc, output_nc, ngf, ndf, n_layers_D, norm_layer=nn.BatchNorm2d, use_dropout=False, pixe_D=False):
+        super(GanVAE, self).__init__()
+        self.recon_loss = recon_loss
+        self.lambda_recon = lambda_recon
+        self.gan_loss = gan_loss
+        self.netG = model
+        init_weights(self.netG)
+        if pixe_D:
+            self.netD = PixelDiscriminator(output_nc, ndf, norm_layer=norm_layer)
+        else:
+            self.netD = NLayerDiscriminator(output_nc, ndf, n_layers_D, norm_layer=norm_layer)
+        init_weights(self.netD)
+        self.netD.train()
+    
+    def forward(self, input: torch.Tensor, train: bool=False):
+        """Run forward pass; called by both functions <optimize_parameters> and <test>."""
+        output = self.netG(input, train=train)  # G(A)
+        return [output, input]
+    
+    def loss_function(self,
+                      *args,
+                      **kwargs) -> dict:
+        
+        vae_output = args[0]
+        fake = vae_output[0]
+        real = args[1]
+        
+        # enable backprop for D
+        for param in self.netD.parameters():
+            param.requires_grad = True
+        
+        # Fake Detection and Loss
+        pred_fake = self.netD(fake.detach())
+        loss_gan_fake = self.gan_loss(pred_fake, False)
+        
+        # Real Detection and Loss
+        pred_real = self.netD(real)
+        loss_gan_real = self.gan_loss(pred_real, True)
+        
+        # combine loss
+        loss = (loss_gan_fake + loss_gan_real) * 0.5
+        return {'loss': loss, 'D_fake':loss_gan_fake, 'D_real':loss_gan_real}
+
+    def loss_function_G(self,
+                      *args,
+                      **kwargs) -> dict:
+        
+        vae_output = args[0]
+        fake = vae_output[0]
+        real = args[1]
+        
+        # Vae Loss
+        losses = self.netG.loss_function(*vae_output)
+        recon_loss = losses['loss']
+        del losses['loss']
+        
+        # disable backprop for D
+        for param in self.netD.parameters():
+            param.requires_grad = False
+        
+        pred_fake = self.netD(fake)
+        loss_gan = self.gan_loss(pred_fake, True)
+        
+        # combine loss
+        loss = loss_gan + recon_loss * self.lambda_recon
+        losses['loss_G'] = loss
+        losses['G_GAN'] = loss_gan
+        losses['vae_recon'] = recon_loss
+        return losses
 
 
 class VanillaVAE(BaseVAE):
@@ -42,7 +116,7 @@ class VanillaVAE(BaseVAE):
                  hidden_dims: List = None,
                  kld_weight: float = 1.0,
                  **kwargs) -> None:
-        super(BetaVAE, self).__init__(recon_loss=recon_loss)
+        super(VanillaVAE, self).__init__(recon_loss=recon_loss)
 
         self.kld_weight = kld_weight
         self.latent_dim = latent_dim
@@ -140,7 +214,11 @@ class VanillaVAE(BaseVAE):
         eps = torch.randn_like(std)
         return eps * std + mu
 
-    def forward(self, input: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, train: bool=False, **kwargs) -> torch.Tensor:
+        if train:
+            self.train()
+        else:
+            self.eval()
         mu, log_var = self.encode(input)
         z = self.reparameterize(mu, log_var)
         return  [self.decode(z), input, mu, log_var]
@@ -159,13 +237,13 @@ class VanillaVAE(BaseVAE):
         input = args[1]
         mu = args[2]
         log_var = args[3]
-
+        
         recons_loss = self.recon_loss(recons, input)
-
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
 
         loss = recons_loss + self.kld_weight * kld_loss
-        return {'loss': loss, 'Reconstruction_Loss':recons_loss.detach(), 'KLD':-kld_loss.detach()}
+        
+        return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
 
     def sample(self,
                num_samples:int,
@@ -313,7 +391,11 @@ class BetaVAE(BaseVAE):
         eps = torch.randn_like(std)
         return eps * std + mu
 
-    def forward(self, input: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, train: bool=False, **kwargs) -> torch.Tensor:
+        if train:
+            self.train()
+        else:
+            self.eval()
         mu, log_var = self.encode(input)
         z = self.reparameterize(mu, log_var)
         return  [self.decode(z), input, mu, log_var]
@@ -555,7 +637,11 @@ class VQVAE(BaseVAE):
         result = self.decoder(z)
         return result
 
-    def forward(self, input: torch.Tensor, **kwargs) -> List[torch.Tensor]:
+    def forward(self, input: torch.Tensor, train: bool=False, **kwargs) -> List[torch.Tensor]:
+        if train:
+            self.train()
+        else:
+            self.eval()
         encoding = self.encode(input)[0]
         quantized_inputs, vq_loss = self.vq_layer(encoding)
         return [self.decode(quantized_inputs), input, vq_loss]
@@ -594,15 +680,28 @@ class VQVAE(BaseVAE):
         return self.forward(x)[0]
 
 
-
 if __name__ == "__main__":
     # Data testing
     sample_data = torch.normal(0, 1, size=(2, 3, 256, 256))
     recon_loss = nn.MSELoss()
+
+    def vanillagan_loss(
+        prediction: torch.Tensor,
+        target_is_real: bool,
+        real_label: float = 1.0,
+        fake_label: float = 0.0,
+    ):
+        if target_is_real:
+            target_tensor = torch.tensor(real_label).expand_as(prediction)
+        else:
+            target_tensor = torch.tensor(fake_label).expand_as(prediction)
+        return torch.mean(torch.nn.functional.binary_cross_entropy_with_logits(prediction, target_tensor))
+    
+    gan_loss = vanillagan_loss
     
     # Test models
     model = VanillaVAE(recon_loss=recon_loss, in_channels=3, latent_dim=256, kld_weight=0.00025)
-    loss = model.loss_function(*model(sample_data))
+    loss = model.loss_function(*model(sample_data), train=True)
     print(loss)
     
     model = VQVAE(recon_loss=recon_loss, in_channels=3, embedding_dim=64, num_embeddings=512, img_size=64, beta=0.25)
@@ -612,4 +711,14 @@ if __name__ == "__main__":
     model = BetaVAE(recon_loss=recon_loss, in_channels=3, latent_dim=128, beta=4,
                     loss_type='B', gamma=10.0, max_capacity=25, capacity_max_iter=10000)
     loss = model.loss_function(*model(sample_data))
+    print(loss)
+    
+    vae_model = VanillaVAE(recon_loss=recon_loss, in_channels=3, latent_dim=256, kld_weight=0.00025)
+    model = GanVAE(vae_model, recon_loss, gan_loss, 100.0, 1, 3, 64, 64, 3)
+    output = model(sample_data)
+    loss = model.loss_function(*output)
+    print(loss)
+    
+    #Check generator
+    loss = model.loss_function_G(*output)
     print(loss)

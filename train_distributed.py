@@ -10,7 +10,6 @@ from hydra.utils import instantiate
 import torch.nn.functional as F
 from collections import namedtuple
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils import fix_random_seeds, set_logger
@@ -70,16 +69,29 @@ def train(cfg):
     # Model to GPU
     criterion = get_loss(cfg.exp_params['criterion_name'], delta=cfg.exp_params['criterion_delta'])
     model = instantiate(cfg.model_params, recon_loss=criterion)
+    if cfg.gan_model is not None:
+        criterion_gan = get_loss(cfg.exp_params['criterion_gan'])
+        model = instantiate(cfg.gan_model, model=model, gan_loss=criterion_gan)
     
     model = model.to(cfg.exp_params['device'])
     model = DDP(model, device_ids=[cfg.exp_params['device']])
 
     logger.info(f"Building model {cfg.model_params['name']} done")
+    if cfg.optimizer_gan is not None:
+        optimizer_gan = instantiate(cfg.optimizer_gan, params=model.module.netG.parameters())
+        optimizer = instantiate(cfg.optimizer, params=model.module.netD.parameters())
+    else:
+        optimizer_gan = None
+        optimizer = instantiate(cfg.optimizer, params=model.parameters())
     
-    optimizer = instantiate(cfg.optimizer, params=model.parameters())
     logger.info("Building optimizer and criterion done.")
     
     name_log = f"{cfg.exp_params['seed']}_{cfg.model_params['name']}_{cfg.data_params['name']}_{cfg.exp_params['criterion_name']}_{cfg.optimizer['_target_']}"  
+    if cfg.gan_model is not None:
+        name_log += f"_{cfg.gan_model['_target_']}_{cfg.exp_params['criterion_gan']}"
+    if cfg.optimizer_gan is not None:
+        name_log += f"_{cfg.optimizer_gan['_target_']}"
+        
     mssim = MSSIM()
     
     checkpoint_load = cfg.logging_params['checkpoint_dir'] + "/" + name_log
@@ -91,6 +103,8 @@ def train(cfg):
             #map_location="cuda:" + str(torch.distributed.get_rank() % torch.cuda.device_count()))
         model.module.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if optimizer_gan is not None:
+            optimizer_gan.load_state_dict(checkpoint['optimizer_gan_state_dict'])
         best = checkpoint['mae']
         start_epoch = checkpoint['epoch']
         run_id = checkpoint['run_id']
@@ -109,7 +123,9 @@ def train(cfg):
                            "model": cfg.model_params['name'],
                            "dataset": cfg.data_params['name'],
                            "criterion": cfg.exp_params['criterion_name'],
-                           "optimizer":cfg.optimizer["_target_"]},
+                           "optimizer":cfg.optimizer["_target_"],
+                           "optimizer_gan":cfg.optimizer_gan["_target_"] if cfg.optimizer_gan is not None else None,
+                           "gan_model":cfg.gan_model["_target_"] if cfg.gan_model is not None else None},
                           )
     else:
         cm = nullcontext()
@@ -121,27 +137,37 @@ def train(cfg):
             train_loader.sampler.set_epoch(epoch)
             logger.info(f"Epoch {epoch + 1}/{cfg.exp_params['epochs']}")
             
-            model.train()
-            scaler = GradScaler()
-            
             avg_losses = {}
             for batch in tqdm(train_loader, desc="Training", leave=False):
                 optimizer.zero_grad(set_to_none=True)
                 batch = batch.to(cfg.exp_params['device'])
-                with autocast():  # mixed precision
-                    out = model(batch)
+                
+                out = model(batch, train=True)
                 losses = model.module.loss_function(*out)
                 loss = losses["loss"]
                 
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                loss.backward()
+                optimizer.step()
                 
                 for key, value in losses.items():
                     if f"train/{key}" not in avg_losses:
                         avg_losses[f"train/{key}"] = [value.item()]
                     else:
                         avg_losses[f"train/{key}"].append(value.item())
+                
+                if optimizer_gan is not None:
+                    optimizer_gan.zero_grad(set_to_none=True)
+                    losses = model.module.loss_function(*out)
+                    loss = losses["loss_G"]
+                
+                    loss.backward()
+                    optimizer_gan.step()
+                    
+                    for key, value in losses.items():
+                        if f"train/{key}" not in avg_losses:
+                            avg_losses[f"train/{key}"] = [value.item()]
+                        else:
+                            avg_losses[f"train/{key}"].append(value.item())
             
             # save checkpoints
             if rank == 0:
@@ -152,9 +178,14 @@ def train(cfg):
                         batch = batch.to(cfg.exp_params['device'])
                         out = model.module(batch)
                         recons = out[0]
-                        input = out[1]
+                        if isinstance(recons, tuple):
+                            recons = recons[0]
+                        input = batch
                         
-                        losses = model.module.loss_function(*out)
+                        if hasattr(model.module, "loss_function_G"):
+                            losses = model.module.loss_function_G(*out)
+                        else:
+                            losses = model.module.loss_function(*out)
                         losses['mse'] = F.mse_loss(recons, input)
                         losses['psnr'] = 10 * torch.log10(1 / losses['mse'])
                         losses['mssim'] = torch.mean(torch.as_tensor(([mssim(rec, inp) for rec, inp in zip(recons, input)])))
@@ -194,6 +225,7 @@ def train(cfg):
                         'epoch': epoch,
                         'model_state_dict': model.module.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
+                        'optimizer_gan_state_dict': optimizer_gan.state_dict() if optimizer_gan is not None else None,
                         'loss': avg_losses['train/loss'],
                         'mae': avg_losses['val/mae'],
                         'run_id': run_id
@@ -205,6 +237,7 @@ def train(cfg):
                         'epoch': epoch,
                         'model_state_dict': model.module.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
+                        'optimizer_gan_state_dict': optimizer_gan.state_dict() if optimizer_gan is not None else None,
                         'loss': avg_losses['train/loss'],
                         'mae': avg_losses['val/mae'],
                         'run_id': run_id
@@ -213,6 +246,7 @@ def train(cfg):
                         'epoch': epoch,
                         'model_state_dict': model.module.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
+                        'optimizer_gan_state_dict': optimizer_gan.state_dict() if optimizer_gan is not None else None,
                         'loss': avg_losses['train/loss'],
                         'mae': avg_losses['val/mae'],
                         'run_id': run_id
@@ -224,6 +258,7 @@ def train(cfg):
                         'epoch': epoch,
                         'model_state_dict': model.module.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
+                        'optimizer_gan_state_dict': optimizer_gan.state_dict() if optimizer_gan is not None else None,
                         'loss': avg_losses['train/loss'],
                         'mae': avg_losses['val/mae'],
                         'run_id': run_id
